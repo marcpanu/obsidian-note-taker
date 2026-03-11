@@ -1,0 +1,9 @@
+{
+  "id": "ai-notetaker",
+  "name": "AI Notetaker",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Record audio and transcribe with speaker diarization using AssemblyAI.",
+  "author": "Marc",
+  "isDesktopOnly": true
+}
