@@ -1,4 +1,4 @@
-import { Plugin, PluginSettingTab, Setting, Notice, MarkdownView, Editor } from "obsidian";
+import { Plugin, PluginSettingTab, Setting, Notice, MarkdownView, Editor, requestUrl } from "obsidian";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -169,7 +169,8 @@ export default class AINotetakerPlugin extends Plugin {
 
 			this.setStatusBar("");
 			new Notice("AI Notetaker: Transcription complete!");
-		} catch (err) {
+		} catch (err: any) {
+			console.error("AI Notetaker error:", err);
 			const message = err instanceof Error ? err.message : String(err);
 			const errorBlock = `\n> ⚠️ Transcription failed: ${message}\n`;
 			this.insertIntoEditor(editor, errorBlock);
@@ -179,46 +180,53 @@ export default class AINotetakerPlugin extends Plugin {
 	}
 
 	private async uploadAudio(blob: Blob, apiKey: string): Promise<string> {
-		const response = await fetch("https://api.assemblyai.com/v1/upload", {
-			method: "POST",
-			headers: {
-				authorization: apiKey,
-				"Content-Type": "application/octet-stream",
-			},
-			body: blob,
-		});
-
-		if (!response.ok) {
-			throw new Error(`Audio upload failed (HTTP ${response.status})`);
+		const arrayBuffer = await blob.arrayBuffer();
+		console.log("AI Notetaker: uploading audio, size:", arrayBuffer.byteLength);
+		try {
+			const response = await requestUrl({
+				url: "https://api.assemblyai.com/v2/upload",
+				method: "POST",
+				headers: {
+					authorization: apiKey,
+					"Content-Type": "application/octet-stream",
+				},
+				body: arrayBuffer,
+			});
+			console.log("AI Notetaker: upload response:", response.status, response.json);
+			return response.json.upload_url;
+		} catch (err: any) {
+			console.error("AI Notetaker: upload failed:", err);
+			throw err;
 		}
-
-		const data = await response.json();
-		return data.upload_url;
 	}
 
 	private async submitTranscription(audioUrl: string, apiKey: string): Promise<string> {
-		const response = await fetch("https://api.assemblyai.com/v2/transcript", {
-			method: "POST",
-			headers: {
-				authorization: apiKey,
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify({
-				audio_url: audioUrl,
-				speaker_labels: true,
-				summarization: true,
-				summary_model: "informative",
-				summary_type: "bullets",
-				auto_highlights: true,
-			}),
-		});
-
-		if (!response.ok) {
-			throw new Error(`Transcript submission failed (HTTP ${response.status})`);
+		const requestBody = {
+			audio_url: audioUrl,
+			speech_models: ["universal-3-pro"],
+			speaker_labels: true,
+			summarization: true,
+			summary_model: "informative",
+			summary_type: "bullets",
+			auto_highlights: true,
+		};
+		console.log("AI Notetaker: submitting transcription:", JSON.stringify(requestBody));
+		try {
+			const response = await requestUrl({
+				url: "https://api.assemblyai.com/v2/transcript",
+				method: "POST",
+				headers: {
+					authorization: apiKey,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify(requestBody),
+			});
+			console.log("AI Notetaker: submit response:", response.status, response.json);
+			return response.json.id;
+		} catch (err: any) {
+			console.error("AI Notetaker: submit failed:", err);
+			throw err;
 		}
-
-		const data = await response.json();
-		return data.id;
 	}
 
 	private async pollTranscription(
@@ -228,15 +236,16 @@ export default class AINotetakerPlugin extends Plugin {
 		const url = `https://api.assemblyai.com/v2/transcript/${transcriptId}`;
 
 		while (true) {
-			const response = await fetch(url, {
+			const response = await requestUrl({
+				url,
 				headers: { authorization: apiKey },
 			});
 
-			if (!response.ok) {
+			if (response.status >= 400) {
 				throw new Error(`Polling failed (HTTP ${response.status})`);
 			}
 
-			const data: AssemblyAITranscriptResponse = await response.json();
+			const data: AssemblyAITranscriptResponse = response.json;
 
 			if (data.status === "completed") {
 				return data;
