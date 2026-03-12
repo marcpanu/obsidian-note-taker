@@ -28,14 +28,41 @@ import {
 interface AINotetakerSettings {
 	assemblyAiApiKey: string;
 	picovoiceAccessKey: string;
+	geminiApiKey: string;
+	templateFolder: string;
+	selectedTemplate: string;
+	geminiModel: string;
 	speakerProfiles: Record<string, string>; // name → base64-encoded EagleProfile
 }
 
 const DEFAULT_SETTINGS: AINotetakerSettings = {
 	assemblyAiApiKey: "",
 	picovoiceAccessKey: "",
+	geminiApiKey: "",
+	templateFolder: "AI Notetaker Templates",
+	selectedTemplate: "Default",
+	geminiModel: "gemini-2.5-flash",
 	speakerProfiles: {},
 };
+
+const DEFAULT_TEMPLATE = `You are a meeting notes assistant. Given the following meeting transcript with speaker labels, produce structured meeting notes in markdown format.
+
+## Output format:
+
+Your response MUST begin with a single-line title for the meeting on the first line, prefixed with "# " (markdown H1). The title should be a concise, descriptive summary of the meeting topic (e.g., "# Q2 Marketing Strategy Review"). Do NOT include a date in the title.
+
+### Attendees
+List each speaker with their name. If their role or organization is mentioned in the conversation, include it.
+
+### Summary
+Provide a clear overall summary of the meeting. Use a mix of prose and bullet points as appropriate to capture key discussion points, decisions made, and important context.
+
+### Action Items
+List action items as a task list. Tag each with the owner.
+- [ ] **Owner:** Description of the action item
+
+## Transcript:
+{{transcript}}`;
 
 interface AssemblyAIUtterance {
 	speaker: string;
@@ -44,19 +71,11 @@ interface AssemblyAIUtterance {
 	end: number;
 }
 
-interface AssemblyAIHighlight {
-	text: string;
-	count: number;
-	rank: number;
-}
-
 interface AssemblyAITranscriptResponse {
 	id: string;
 	status: "queued" | "processing" | "completed" | "error";
 	error?: string;
-	summary?: string;
 	utterances?: AssemblyAIUtterance[];
-	auto_highlights_result?: { results: AssemblyAIHighlight[] };
 }
 
 const SPEAKER_VIEW_TYPE = "ai-notetaker-speakers";
@@ -414,8 +433,24 @@ export default class AINotetakerPlugin extends Plugin {
 				console.log("AI Notetaker: Auto-mapped speakers:", Object.fromEntries(speakerMap));
 			}
 
-			// Insert markdown immediately (known speakers get names, unknowns get "Speaker X")
-			const markdown = this.buildMarkdown(result, speakerMap);
+			// Build the transcript text with speaker names
+			const transcriptText = this.buildTranscriptText(result.utterances ?? [], speakerMap);
+
+			// Generate Gemini summary if API key is configured
+			let geminiOutput = "";
+			if (this.settings.geminiApiKey) {
+				this.setStatusBar("🤖 Generating notes…");
+				try {
+					const template = await this.loadSelectedTemplate();
+					geminiOutput = await this.callGemini(transcriptText, template);
+				} catch (err: any) {
+					console.error("AI Notetaker: Gemini error:", err);
+					geminiOutput = `> ⚠️ Gemini summarization failed: ${err.message}\n`;
+				}
+			}
+
+			// Build and insert final markdown
+			const markdown = this.buildMarkdown(transcriptText, geminiOutput, speakerMap);
 			this.insertIntoEditor(editor, markdown);
 
 			// Store data for deferred "Label Speakers" command
@@ -426,13 +461,12 @@ export default class AINotetakerPlugin extends Plugin {
 
 			this.setStatusBar("");
 
-			// Hint about labeling if there are unlabeled speakers
 			const hasUnlabeled = result.utterances?.some(
 				(u) => !speakerMap?.has(u.speaker),
 			);
 			if (hasUnlabeled && this.settings.picovoiceAccessKey) {
 				new Notice(
-					'AI Notetaker: Transcription complete! Use "Label Speakers" command to name speakers and enroll them.',
+					'AI Notetaker: Done! Use "Label Speakers" to name unknown speakers.',
 					8000,
 				);
 			} else {
@@ -603,10 +637,6 @@ export default class AINotetakerPlugin extends Plugin {
 				audio_url: audioUrl,
 				speech_models: ["universal-3-pro"],
 				speaker_labels: true,
-				summarization: true,
-				summary_model: "informative",
-				summary_type: "bullets",
-				auto_highlights: true,
 			}),
 		});
 		return response.json.id;
@@ -641,60 +671,142 @@ export default class AINotetakerPlugin extends Plugin {
 		return new Promise((resolve) => setTimeout(resolve, ms));
 	}
 
-	// -- Markdown builder ----------------------------------------------------
+	// -- Template loading ----------------------------------------------------
 
+	/** Load the selected prompt template. Returns template string. */
+	private async loadSelectedTemplate(): Promise<string> {
+		const selected = this.settings.selectedTemplate;
+		if (selected === "Default") return DEFAULT_TEMPLATE;
+
+		const folder = this.settings.templateFolder;
+		const filePath = `${folder}/${selected}.md`;
+		const file = this.app.vault.getAbstractFileByPath(filePath);
+		if (file && "extension" in file) {
+			const content = await this.app.vault.read(file as any);
+			if (content.trim()) return content;
+		}
+
+		console.warn(`AI Notetaker: Template "${filePath}" not found, using Default.`);
+		return DEFAULT_TEMPLATE;
+	}
+
+	/** List available template names from the template folder. */
+	async listTemplates(): Promise<string[]> {
+		const names = ["Default"];
+		const folder = this.settings.templateFolder;
+		const abstractFolder = this.app.vault.getAbstractFileByPath(folder);
+		if (abstractFolder && "children" in abstractFolder) {
+			for (const child of (abstractFolder as any).children) {
+				if (child.extension === "md") {
+					names.push(child.basename);
+				}
+			}
+		}
+		return names;
+	}
+
+	// -- Gemini integration --------------------------------------------------
+
+	private async callGemini(transcriptText: string, template: string): Promise<string> {
+		const prompt = template.includes("{{transcript}}")
+			? template.replace("{{transcript}}", transcriptText)
+			: template + "\n\n## Transcript:\n" + transcriptText;
+
+		const model = this.settings.geminiModel || "gemini-2.5-flash-lite";
+		const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${this.settings.geminiApiKey}`;
+
+		console.log("AI Notetaker: calling Gemini", model);
+		const response = await requestUrl({
+			url,
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				contents: [{ parts: [{ text: prompt }] }],
+			}),
+		});
+
+		const candidate = response.json?.candidates?.[0];
+		if (!candidate) {
+			throw new Error("No response from Gemini");
+		}
+
+		const text = candidate.content?.parts?.[0]?.text ?? "";
+		console.log("AI Notetaker: Gemini response length:", text.length);
+		return text;
+	}
+
+	// -- Transcript & Markdown builder ---------------------------------------
+
+	/** Build plain-text transcript with speaker names for Gemini input. */
+	private buildTranscriptText(
+		utterances: AssemblyAIUtterance[],
+		speakerMap: Map<string, string> | null,
+	): string {
+		if (utterances.length === 0) return "No transcript available.";
+		return utterances
+			.map((u) => {
+				const name = speakerMap?.get(u.speaker) ?? `Speaker ${u.speaker}`;
+				return `${name}: ${u.text}`;
+			})
+			.join("\n");
+	}
+
+	/** Build final markdown: Gemini notes + raw transcript. */
 	private buildMarkdown(
-		result: AssemblyAITranscriptResponse,
+		transcriptText: string,
+		geminiOutput: string,
 		speakerMap: Map<string, string> | null,
 	): string {
 		const now = new Date();
-		const date = now.toISOString().slice(0, 10);
+		const date = now.toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
 		const time = now.toTimeString().slice(0, 5);
+
+		let title = "Meeting Notes";
+		let notesBody = geminiOutput.trim();
+
+		// Extract title from Gemini output if it starts with "# "
+		if (notesBody.startsWith("# ")) {
+			const newlineIdx = notesBody.indexOf("\n");
+			if (newlineIdx > 0) {
+				title = notesBody.slice(2, newlineIdx).trim();
+				notesBody = notesBody.slice(newlineIdx + 1).trim();
+			} else {
+				title = notesBody.slice(2).trim();
+				notesBody = "";
+			}
+		}
 
 		const lines: string[] = [
 			"",
 			"---",
-			"## 🎙️ Meeting Notes",
-			`**Date:** ${date} ${time}`,
+			`## ${title}`,
+			`*${date} at ${time}*`,
 			"",
-			"### Summary",
 		];
 
-		if (result.summary) {
-			const bullets = result.summary
-				.split("\n")
-				.map((l) => l.trim())
-				.filter((l) => l.length > 0);
-			for (const bullet of bullets) {
-				lines.push(bullet.startsWith("-") ? bullet : `- ${bullet}`);
-			}
-		} else {
-			lines.push("- No summary available");
+		if (notesBody) {
+			lines.push(notesBody);
+		} else if (!geminiOutput) {
+			lines.push("*No Gemini API key configured — set one in AI Notetaker settings for AI-generated notes.*");
 		}
 
 		lines.push("");
-		lines.push("### Action Items");
-
-		const highlights = result.auto_highlights_result?.results;
-		if (highlights && highlights.length > 0) {
-			for (const h of highlights) {
-				lines.push(`- ${h.text}`);
-			}
-		} else {
-			lines.push("- No action items detected");
-		}
-
+		lines.push("---");
 		lines.push("");
 		lines.push("### Transcript");
+		lines.push("");
 
-		if (result.utterances && result.utterances.length > 0) {
-			for (const u of result.utterances) {
-				const name = speakerMap?.get(u.speaker) ?? `Speaker ${u.speaker}`;
-				lines.push(`**${name}:** ${u.text}`);
-				lines.push("");
+		// Raw transcript with speaker labels (markdown bold)
+		for (const line of transcriptText.split("\n")) {
+			// Convert "Speaker A: text" to "**Speaker A:** text"
+			const colonIdx = line.indexOf(": ");
+			if (colonIdx > 0) {
+				const speaker = line.slice(0, colonIdx);
+				const text = line.slice(colonIdx + 2);
+				lines.push(`**${speaker}:** ${text}`);
+			} else {
+				lines.push(line);
 			}
-		} else {
-			lines.push("No transcript available.");
 			lines.push("");
 		}
 
@@ -1232,6 +1344,84 @@ class AINotetakerSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					}),
 			);
+
+		// -- Gemini settings --
+
+		containerEl.createEl("h3", { text: "Gemini (AI Notes)" });
+
+		new Setting(containerEl)
+			.setName("Gemini API Key")
+			.setDesc(
+				createFragment((frag) => {
+					frag.appendText("For AI-generated meeting notes. Get one at ");
+					frag.createEl("a", {
+						text: "aistudio.google.com",
+						href: "https://aistudio.google.com/apikey",
+					});
+					frag.appendText(". Leave blank to skip AI notes.");
+				}),
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("your-gemini-api-key")
+					.setValue(this.plugin.settings.geminiApiKey)
+					.onChange(async (value) => {
+						this.plugin.settings.geminiApiKey = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Gemini Model")
+			.setDesc("Which Gemini model to use for generating notes.")
+			.addDropdown((drop) =>
+				drop
+					.addOptions({
+						"gemini-2.5-flash": "Gemini 2.5 Flash",
+						"gemini-2.5-pro": "Gemini 2.5 Pro",
+						"gemini-3.1-pro": "Gemini 3.1 Pro",
+					})
+					.setValue(this.plugin.settings.geminiModel)
+					.onChange(async (value) => {
+						this.plugin.settings.geminiModel = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Template Folder")
+			.setDesc("Vault folder containing prompt template .md files. Templates use {{transcript}} as placeholder.")
+			.addText((text) =>
+				text
+					.setPlaceholder("AI Notetaker Templates")
+					.setValue(this.plugin.settings.templateFolder)
+					.onChange(async (value) => {
+						this.plugin.settings.templateFolder = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		// Template dropdown — populated async
+		const templateSetting = new Setting(containerEl)
+			.setName("Selected Template")
+			.setDesc("Choose which prompt template to use for AI notes generation.");
+
+		this.plugin.listTemplates().then((templates) => {
+			templateSetting.addDropdown((drop) => {
+				for (const t of templates) {
+					drop.addOption(t, t);
+				}
+				drop.setValue(this.plugin.settings.selectedTemplate);
+				drop.onChange(async (value) => {
+					this.plugin.settings.selectedTemplate = value;
+					await this.plugin.saveSettings();
+				});
+			});
+		});
+
+		// -- Speaker settings --
+
+		containerEl.createEl("h3", { text: "Speaker Recognition" });
 
 		const profileCount = Object.keys(this.plugin.settings.speakerProfiles).length;
 		new Setting(containerEl)
