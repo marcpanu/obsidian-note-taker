@@ -15,5 +15,9 @@
     "esbuild": "^0.19.11",
     "obsidian": "^1.4.11",
     "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "@picovoice/eagle-web": "^2.0.0",
+    "@picovoice/web-voice-processor": "^4.0.9"
   }
 }
