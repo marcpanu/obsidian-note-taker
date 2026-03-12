@@ -10,6 +10,7 @@ import {
 	ItemView,
 	WorkspaceLeaf,
 	setIcon,
+	TFolder,
 } from "obsidian";
 import {
 	EagleSpeakerManager,
@@ -115,6 +116,7 @@ export default class AINotetakerPlugin extends Plugin {
 		this.addCommand({
 			id: "start-stop-recording",
 			name: "Start / Stop Recording",
+			icon: "mic",
 			editorCallback: (editor: Editor) => {
 				if (this.isRecording) {
 					this.stopRecording(editor);
@@ -127,6 +129,7 @@ export default class AINotetakerPlugin extends Plugin {
 		this.addCommand({
 			id: "label-speakers",
 			name: "Label Speakers",
+			icon: "users",
 			editorCallback: (editor: Editor) => {
 				this.labelSpeakersInNote(editor);
 			},
@@ -361,7 +364,7 @@ export default class AINotetakerPlugin extends Plugin {
 			});
 		} catch (err) {
 			console.error("AI Notetaker: Failed to start audio capture:", err);
-			new Notice("AI Notetaker: Speaker recognition unavailable — recording without it.");
+			new Notice("AI Notetaker: Speaker recognition unavailable on this device — recording without it.", 5000);
 			this.cleanupEagleRecording();
 		}
 	}
@@ -1388,18 +1391,32 @@ class AINotetakerSettingTab extends PluginSettingTab {
 					}),
 			);
 
-		new Setting(containerEl)
+		const folderSetting = new Setting(containerEl)
 			.setName("Template Folder")
-			.setDesc("Vault folder containing prompt template .md files. Templates use {{transcript}} as placeholder.")
-			.addText((text) =>
-				text
-					.setPlaceholder("AI Notetaker Templates")
-					.setValue(this.plugin.settings.templateFolder)
-					.onChange(async (value) => {
-						this.plugin.settings.templateFolder = value;
-						await this.plugin.saveSettings();
-					}),
-			);
+			.setDesc("Vault folder containing prompt template .md files. Templates use {{transcript}} as placeholder.");
+
+		// Build folder dropdown from all vault folders
+		const folders: string[] = [""];
+		this.app.vault.getAllLoadedFiles().forEach((f) => {
+			if (f instanceof TFolder && f.path !== "/") {
+				folders.push(f.path);
+			}
+		});
+		folders.sort();
+
+		folderSetting.addDropdown((drop) => {
+			drop.addOption("", "(none)");
+			for (const f of folders) {
+				if (f) drop.addOption(f, f);
+			}
+			drop.setValue(this.plugin.settings.templateFolder);
+			drop.onChange(async (value) => {
+				this.plugin.settings.templateFolder = value;
+				await this.plugin.saveSettings();
+				// Refresh to update template list
+				this.display();
+			});
+		});
 
 		// Template dropdown — populated async
 		const templateSetting = new Setting(containerEl)
