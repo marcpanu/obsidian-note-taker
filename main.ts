@@ -1,4 +1,16 @@
-import { Plugin, PluginSettingTab, Setting, Notice, Editor, Modal, requestUrl } from "obsidian";
+import {
+	Plugin,
+	PluginSettingTab,
+	Setting,
+	Notice,
+	Editor,
+	Modal,
+	requestUrl,
+	MarkdownView,
+	ItemView,
+	WorkspaceLeaf,
+	setIcon,
+} from "obsidian";
 import {
 	EagleSpeakerManager,
 	AudioPcmCapture,
@@ -47,6 +59,8 @@ interface AssemblyAITranscriptResponse {
 	auto_highlights_result?: { results: AssemblyAIHighlight[] };
 }
 
+const SPEAKER_VIEW_TYPE = "ai-notetaker-speakers";
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -54,9 +68,10 @@ interface AssemblyAITranscriptResponse {
 export default class AINotetakerPlugin extends Plugin {
 	settings: AINotetakerSettings = DEFAULT_SETTINGS;
 	private statusBarItem: HTMLElement | null = null;
+	private ribbonIconEl: HTMLElement | null = null;
 	private mediaRecorder: MediaRecorder | null = null;
 	private audioChunks: Blob[] = [];
-	private isRecording = false;
+	isRecording = false;
 
 	// Eagle state during recording
 	private eagleManager: EagleSpeakerManager | null = null;
@@ -115,6 +130,29 @@ export default class AINotetakerPlugin extends Plugin {
 		});
 
 		this.addSettingTab(new AINotetakerSettingTab(this.app, this));
+
+		// Ribbon icon — toggles recording
+		this.ribbonIconEl = this.addRibbonIcon("mic", "AI Notetaker: Record", () => {
+			const editor = this.getMarkdownEditor();
+			if (!editor) {
+				new Notice("AI Notetaker: Open a note first.");
+				return;
+			}
+			if (this.isRecording) {
+				this.stopRecording(editor);
+			} else {
+				this.startRecording();
+			}
+		});
+
+		// Sidebar view for speaker management
+		this.registerView(SPEAKER_VIEW_TYPE, (leaf) => new SpeakerPanelView(leaf, this));
+
+		this.addCommand({
+			id: "open-speaker-panel",
+			name: "Open Speaker Panel",
+			callback: () => this.activateSpeakerPanel(),
+		});
 	}
 
 	onunload() {
@@ -123,6 +161,20 @@ export default class AINotetakerPlugin extends Plugin {
 		}
 		this.cleanupEagleRecording();
 		this.setStatusBar("");
+		this.app.workspace.detachLeavesOfType(SPEAKER_VIEW_TYPE);
+	}
+
+	async activateSpeakerPanel() {
+		const existing = this.app.workspace.getLeavesOfType(SPEAKER_VIEW_TYPE);
+		if (existing.length > 0) {
+			this.app.workspace.revealLeaf(existing[0]);
+			return;
+		}
+		const leaf = this.app.workspace.getRightLeaf(false);
+		if (leaf) {
+			await leaf.setViewState({ type: SPEAKER_VIEW_TYPE, active: true });
+			this.app.workspace.revealLeaf(leaf);
+		}
 	}
 
 	// -- Settings helpers ----------------------------------------------------
@@ -138,7 +190,44 @@ export default class AINotetakerPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	// -- Status bar helpers --------------------------------------------------
+	// -- UI helpers ----------------------------------------------------------
+
+	/** Find the most recent MarkdownView editor, even if a sidebar panel is focused. */
+	getMarkdownEditor(): Editor | null {
+		// Try active view first
+		const active = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (active) return active.editor;
+		// Fall back: iterate all leaves and find one with an editor
+		let mdEditor: Editor | null = null;
+		this.app.workspace.iterateAllLeaves((leaf) => {
+			if (!mdEditor && leaf.view.getViewType() === "markdown") {
+				const view = leaf.view as MarkdownView;
+				if (view.editor && (view as any).file) {
+					mdEditor = view.editor;
+				}
+			}
+		});
+		return mdEditor;
+	}
+
+	private updateRibbonIcon() {
+		if (!this.ribbonIconEl) return;
+		if (this.isRecording) {
+			setIcon(this.ribbonIconEl, "square");
+			this.ribbonIconEl.setAttribute("aria-label", "AI Notetaker: Stop Recording");
+			this.ribbonIconEl.addClass("ai-notetaker-recording");
+		} else {
+			setIcon(this.ribbonIconEl, "mic");
+			this.ribbonIconEl.setAttribute("aria-label", "AI Notetaker: Record");
+			this.ribbonIconEl.removeClass("ai-notetaker-recording");
+		}
+	}
+
+	private refreshSpeakerPanel() {
+		for (const leaf of this.app.workspace.getLeavesOfType(SPEAKER_VIEW_TYPE)) {
+			(leaf.view as SpeakerPanelView).refresh();
+		}
+	}
 
 	private setStatusBar(text: string) {
 		if (this.statusBarItem) {
@@ -148,7 +237,7 @@ export default class AINotetakerPlugin extends Plugin {
 
 	// -- Recording -----------------------------------------------------------
 
-	private async startRecording() {
+	async startRecording() {
 		if (!this.settings.assemblyAiApiKey) {
 			new Notice("AI Notetaker: Please set your AssemblyAI API key in settings.");
 			return;
@@ -182,6 +271,8 @@ export default class AINotetakerPlugin extends Plugin {
 		this.isRecording = true;
 		this.recordingStartTime = Date.now();
 		this.setStatusBar("🔴 Recording…");
+		this.updateRibbonIcon();
+		this.refreshSpeakerPanel();
 		new Notice("AI Notetaker: Recording started.");
 
 		// Clear previous recording data
@@ -268,7 +359,7 @@ export default class AINotetakerPlugin extends Plugin {
 		this.pcmBuffer = new Int16Array(0);
 	}
 
-	private stopRecording(editor: Editor) {
+	stopRecording(editor: Editor) {
 		if (!this.mediaRecorder) return;
 
 		const eagleScores = [...this.eagleScores];
@@ -283,6 +374,8 @@ export default class AINotetakerPlugin extends Plugin {
 			});
 			this.audioChunks = [];
 			this.isRecording = false;
+			this.updateRibbonIcon();
+			this.refreshSpeakerPanel();
 
 			this.cleanupEagleRecording();
 
@@ -357,7 +450,7 @@ export default class AINotetakerPlugin extends Plugin {
 
 	// -- Label Speakers (deferred) -------------------------------------------
 
-	private async labelSpeakersInNote(editor: Editor) {
+	async labelSpeakersInNote(editor: Editor) {
 		if (!this.settings.picovoiceAccessKey) {
 			new Notice("AI Notetaker: Set your Picovoice AccessKey in settings to use speaker labeling.");
 			return;
@@ -469,6 +562,7 @@ export default class AINotetakerPlugin extends Plugin {
 				if (profileBase64) {
 					this.settings.speakerProfiles[name] = profileBase64;
 					await this.saveSettings();
+					this.refreshSpeakerPanel();
 					new Notice(`AI Notetaker: "${name}" enrolled successfully!`);
 				} else {
 					new Notice(`AI Notetaker: Not enough audio to enroll "${name}" — try a longer meeting.`);
@@ -947,6 +1041,134 @@ class ManageSpeakersModal extends Modal {
 	onClose() {
 		this.contentEl.empty();
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Speaker Panel (sidebar view)
+// ---------------------------------------------------------------------------
+
+class SpeakerPanelView extends ItemView {
+	private plugin: AINotetakerPlugin;
+
+	constructor(leaf: WorkspaceLeaf, plugin: AINotetakerPlugin) {
+		super(leaf);
+		this.plugin = plugin;
+	}
+
+	getViewType() {
+		return SPEAKER_VIEW_TYPE;
+	}
+
+	getDisplayText() {
+		return "Speakers";
+	}
+
+	getIcon() {
+		return "users";
+	}
+
+	async onOpen() {
+		this.refresh();
+	}
+
+	refresh() {
+		const container = this.containerEl.children[1];
+		container.empty();
+
+		// -- Recording status --
+		const statusSection = container.createEl("div", { cls: "ai-notetaker-panel-section" });
+		statusSection.style.cssText = "padding:12px;border-bottom:1px solid var(--background-modifier-border);";
+
+		if (this.plugin.isRecording) {
+			const statusRow = statusSection.createEl("div");
+			statusRow.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:8px;";
+			const dot = statusRow.createEl("span");
+			dot.style.cssText = "width:10px;height:10px;border-radius:50%;background:#e55;display:inline-block;";
+			statusRow.createEl("span", { text: "Recording…" });
+
+			const stopBtn = statusSection.createEl("button", { text: "Stop Recording" });
+			stopBtn.style.cssText = "width:100%;";
+			stopBtn.addEventListener("click", () => {
+				const editor = this.plugin.getMarkdownEditor();
+				if (editor) {
+					this.plugin.stopRecording(editor);
+				} else {
+					new Notice("AI Notetaker: Open a note to stop recording into.");
+				}
+			});
+		} else {
+			const recBtn = statusSection.createEl("button", { text: "Start Recording" });
+			recBtn.addClass("mod-cta");
+			recBtn.style.cssText = "width:100%;";
+			recBtn.addEventListener("click", () => {
+				if (!this.plugin.getMarkdownEditor()) {
+					new Notice("AI Notetaker: Open a note first.");
+					return;
+				}
+				this.plugin.startRecording();
+			});
+		}
+
+		// -- Enrolled speakers --
+		const speakerSection = container.createEl("div", { cls: "ai-notetaker-panel-section" });
+		speakerSection.style.cssText = "padding:12px;";
+
+		const headerRow = speakerSection.createEl("div");
+		headerRow.style.cssText = "display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;";
+		headerRow.createEl("h6", { text: "Enrolled Speakers" }).style.margin = "0";
+
+		const profiles = this.plugin.settings.speakerProfiles;
+		const names = Object.keys(profiles);
+
+		if (names.length === 0) {
+			speakerSection.createEl("p", {
+				text: "No speakers enrolled yet. Record a meeting and use \"Label Speakers\" to enroll.",
+				cls: "setting-item-description",
+			});
+		} else {
+			for (const name of names) {
+				const row = speakerSection.createEl("div");
+				row.style.cssText =
+					"display:flex;justify-content:space-between;align-items:center;padding:4px 0;";
+
+				const nameEl = row.createEl("span", { text: name });
+
+				const deleteBtn = row.createEl("button");
+				deleteBtn.style.cssText = "padding:2px 6px;font-size:0.8em;";
+				setIcon(deleteBtn, "trash-2");
+				deleteBtn.setAttribute("aria-label", `Delete ${name}`);
+				deleteBtn.addEventListener("click", async () => {
+					delete this.plugin.settings.speakerProfiles[name];
+					await this.plugin.saveSettings();
+					new Notice(`AI Notetaker: Deleted "${name}".`);
+					this.refresh();
+				});
+			}
+		}
+
+		// -- Actions --
+		const actionSection = container.createEl("div", { cls: "ai-notetaker-panel-section" });
+		actionSection.style.cssText = "padding:12px;border-top:1px solid var(--background-modifier-border);";
+
+		const enrollBtn = actionSection.createEl("button", { text: "Enroll Speaker" });
+		enrollBtn.style.cssText = "width:100%;margin-bottom:6px;";
+		enrollBtn.addEventListener("click", () => {
+			new EnrollSpeakerModal(this.plugin.app, this.plugin).open();
+		});
+
+		const labelBtn = actionSection.createEl("button", { text: "Label Speakers in Note" });
+		labelBtn.style.cssText = "width:100%;";
+		labelBtn.addEventListener("click", () => {
+			const editor = this.plugin.getMarkdownEditor();
+			if (editor) {
+				this.plugin.labelSpeakersInNote(editor);
+			} else {
+				new Notice("AI Notetaker: Open a note first.");
+			}
+		});
+	}
+
+	async onClose() {}
 }
 
 // ---------------------------------------------------------------------------
